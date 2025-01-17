@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         X.com Trans Slapper 5000
+// @name         X.com Troon Slapper 5000
 // @namespace    https://your-namespace.example
 // @version      1.0
-// @description  Collect trans-flag users and mute them.
+// @description  Collect trans-flag users in a resizable box with tabs. Remembers size/pos in localStorage, can close the box, with a small "Show Box" button to re-open.
 // @match        https://x.com/*
 // @match        https://www.x.com/*
 // @match        https://twitter.com/*
@@ -16,7 +16,7 @@
   'use strict';
 
   /***************************************************************************
-   * Profile Auto-Mute or Auto-Unmute
+   * PART A: Profile Auto-Mute or Auto-Unmute (unchanged)
    ***************************************************************************/
   const path = location.pathname; // e.g. "/SomeUser"
   const isProfilePage = (
@@ -46,7 +46,6 @@
 
   function attemptAutoUnmuteUI() {
     console.log('[AutoUnmute] Attempting Unmute =>', path);
-    // The same data-testid="mute", so we must ensure text includes "Unmute"
     clickMoreThenItem('mute', 'confirmationSheetConfirm', () => {
       localStorage.setItem('muted:' + path, 'false');
       console.log('[AutoUnmute] Marked unmuted =>', path);
@@ -54,13 +53,6 @@
     }, true /* matchUnmuteText */);
   }
 
-  /**
-   * clickMoreThenItem('mute','confirmationSheetConfirm', cb, matchUnmuteText=false)
-   * - Finds "More" button
-   * - data-testid=menuTestId
-   * - optionally confirm
-   * - callback
-   */
   function clickMoreThenItem(menuTestId, confirmTestId, onSuccess, matchUnmuteText=false) {
     let moreBtn = document.querySelector('button[data-testid="userActions"][aria-label^="More"]')
       || document.querySelector('div[data-testid="userActions"] [role="button"][aria-label^="More"]');
@@ -74,7 +66,7 @@
     setTimeout(() => {
       const allItems = document.querySelectorAll(`div[data-testid="${menuTestId}"]`);
       if (!allItems.length) {
-        console.warn(`[UIFlow] data-testid="${menuTestId}" not found. Maybe user is already in that state.`);
+        console.warn(`[UIFlow] data-testid="${menuTestId}" not found. Possibly user is already in that state.`);
         onSuccess && onSuccess();
         return;
       }
@@ -117,38 +109,75 @@
   }
 
   /***************************************************************************
-   * Main Feed Logic - Resizable + Tabs + Mute/Unmute + Remove + Clear All
+   * PART B: Main Feed Logic - Resizable + Tabs + Mute/Unmute + Remove + Clear All
    ***************************************************************************/
   const processedUserDivs = new WeakSet();
   let storedProfiles = new Set();
 
   // We'll store a boolean setting "showConfirmForMuteAll" in localStorage
-  // Default: true
   let showConfirmForMuteAll = true;
+
+  // We'll also store box position/size in localStorage
+  let boxPosition = { x: 20, y: 20 };      // default
+  let boxSize = { w: 360, h: 420 };       // default
+  let boxClosed = false;                  // track if the user closed it
 
   let box = null;
   let bigTitleRow = null;
   let tabsContainer = null;
   let tabHome = null, tabSettings = null, tabImportExport = null;
   let contentHome = null, contentSettings = null, contentImportExport = null;
-
   let userListDiv = null;
   let manualInputField = null;
 
-  //--- Local helper to manage settings
+  // "Show Box" button (if closed)
+  let showBoxButton = null;
+
   function loadSettings() {
+    // showConfirmForMuteAll
     const val = localStorage.getItem('showConfirmForMuteAll');
-    if (val === 'false') {
-      showConfirmForMuteAll = false;
-    } else {
-      showConfirmForMuteAll = true; // default
-    }
+    if (val === 'false') showConfirmForMuteAll = false;
+
+    // Load box pos
+    try {
+      const posRaw = localStorage.getItem('boxPosition');
+      if (posRaw) {
+        const pos = JSON.parse(posRaw);
+        if (typeof pos.x === 'number' && typeof pos.y === 'number') {
+          boxPosition.x = pos.x;
+          boxPosition.y = pos.y;
+        }
+      }
+    } catch(e) { console.warn('Failed to parse box position:', e); }
+
+    // Load box size
+    try {
+      const sizeRaw = localStorage.getItem('boxSize');
+      if (sizeRaw) {
+        const s = JSON.parse(sizeRaw);
+        if (typeof s.w === 'number' && typeof s.h === 'number') {
+          boxSize.w = s.w;
+          boxSize.h = s.h;
+        }
+      }
+    } catch(e) { console.warn('Failed to parse box size:', e); }
+
+    // Load closed state
+    const closedVal = localStorage.getItem('boxClosed');
+    if (closedVal === 'true') boxClosed = true;
   }
+
   function saveSettings() {
     localStorage.setItem('showConfirmForMuteAll', showConfirmForMuteAll ? 'true' : 'false');
   }
+  function saveBoxPositionAndSize() {
+    localStorage.setItem('boxPosition', JSON.stringify(boxPosition));
+    localStorage.setItem('boxSize', JSON.stringify(boxSize));
+  }
+  function saveBoxClosedState() {
+    localStorage.setItem('boxClosed', boxClosed ? 'true' : 'false');
+  }
 
-  //--- Local helper to manage user store
   function loadStoredProfiles() {
     try {
       const raw = localStorage.getItem('transFlagUsers');
@@ -164,19 +193,45 @@
     localStorage.setItem('transFlagUsers', JSON.stringify(Array.from(storedProfiles)));
   }
 
-  //--- Create the box (resizable, tabbed)
+  /** Create or show the "Show Box" button in top-left if the box is closed. */
+  function createShowBoxButtonIfNeeded() {
+    if (showBoxButton) return; // already exist?
+    showBoxButton = document.createElement('button');
+    showBoxButton.textContent = 'Show Box';
+    showBoxButton.style.position = 'fixed';
+    showBoxButton.style.top = '10px';
+    showBoxButton.style.left = '10px';
+    showBoxButton.style.zIndex = '999999';
+    showBoxButton.style.backgroundColor = '#1DA1F2';
+    showBoxButton.style.color = '#fff';
+    showBoxButton.style.border = 'none';
+    showBoxButton.style.borderRadius = '4px';
+    showBoxButton.style.padding = '6px 12px';
+    showBoxButton.style.cursor = 'pointer';
+    showBoxButton.style.fontSize = '13px';
+
+    showBoxButton.addEventListener('click', () => {
+      boxClosed = false;
+      saveBoxClosedState();
+      showBoxButton.style.display = 'none';
+      if (box) box.style.display = 'block';
+    });
+
+    document.body.appendChild(showBoxButton);
+  }
+
+  // create the main box
   function createBoxIfNeeded() {
     if (box) return;
-
     console.log('[Feed] Creating tabbed, resizable box...');
     box = document.createElement('div');
     box.id = 'trans-flag-box';
-    // Basic styling
+    // We'll apply position & size from localStorage
     box.style.position = 'fixed';
-    box.style.top = '20px';
-    box.style.right = '20px';
-    box.style.width = '360px';
-    box.style.height = '420px';
+    box.style.left = boxPosition.x + 'px';
+    box.style.top = boxPosition.y + 'px';
+    box.style.width = boxSize.w + 'px';
+    box.style.height = boxSize.h + 'px';
     box.style.border = '1px solid #ccc';
     box.style.borderRadius = '8px';
     box.style.backgroundColor = 'rgba(255, 255, 255, 0.97)';
@@ -188,15 +243,39 @@
     box.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
     box.style.zIndex = '999999';
 
-    // Row 1: Big Title
+    // Row 1: Big Title + close button
     bigTitleRow = document.createElement('div');
     bigTitleRow.style.display = 'flex';
     bigTitleRow.style.alignItems = 'center';
+    bigTitleRow.style.justifyContent = 'space-between';
     bigTitleRow.style.padding = '10px';
     bigTitleRow.style.borderBottom = '1px solid #ccc';
     bigTitleRow.style.fontSize = '16px';
     bigTitleRow.style.fontWeight = 'bold';
-    bigTitleRow.textContent = 'Trans Flag Detected';
+
+    const titleText = document.createElement('span');
+    titleText.textContent = 'Trans Flag Detected';
+
+    // Close button (X)
+    const closeBtn = document.createElement('button');
+    closeBtn.textContent = 'X';
+    closeBtn.style.border = 'none';
+    closeBtn.style.background = 'transparent';
+    closeBtn.style.cursor = 'pointer';
+    closeBtn.style.fontSize = '16px';
+    closeBtn.style.fontWeight = 'bold';
+    closeBtn.style.color = '#666';
+    closeBtn.addEventListener('click', () => {
+      if (box) box.style.display = 'none';
+      boxClosed = true;
+      saveBoxClosedState();
+      // show the "Show Box" button
+      createShowBoxButtonIfNeeded();
+      showBoxButton.style.display = 'block';
+    });
+
+    bigTitleRow.appendChild(titleText);
+    bigTitleRow.appendChild(closeBtn);
 
     box.appendChild(bigTitleRow);
 
@@ -207,7 +286,6 @@
     tabsContainer.style.borderBottom = '1px solid #ccc';
     tabsContainer.style.backgroundColor = '#f5f5f5';
 
-    // We do NOT put big title in here, so it's separate
     tabHome = document.createElement('button');
     styleTabButton(tabHome);
     tabHome.textContent = 'Home';
@@ -234,16 +312,15 @@
     contentSettings = createContentDiv();
     contentImportExport = createContentDiv();
 
-    // Populate Home tab
+    // *** HOME TAB ***
     const homeWrap = document.createElement('div');
     homeWrap.style.padding = '8px';
 
-    // Button row: Mute All + Clear All
+    // Mute All + Clear All
     const topBtnRow = document.createElement('div');
     topBtnRow.style.display = 'flex';
     topBtnRow.style.gap = '8px';
 
-    // "Mute All"
     const muteAllBtn = document.createElement('button');
     styleActionButton(muteAllBtn);
     muteAllBtn.textContent = 'Mute All';
@@ -255,13 +332,12 @@
     });
     topBtnRow.appendChild(muteAllBtn);
 
-    // "Clear All"
     const clearAllBtn = document.createElement('button');
     styleActionButton(clearAllBtn);
     clearAllBtn.textContent = 'Clear All';
-    clearAllBtn.style.backgroundColor = '#f4212e'; // a red color
+    clearAllBtn.style.backgroundColor = '#f4212e';
     clearAllBtn.addEventListener('click', () => {
-      if (!confirm('Are you sure you want to remove all from the list?')) return;
+      if (!confirm('Remove all from the list?')) return;
       storedProfiles.clear();
       saveStoredProfiles();
       rebuildUserListUI();
@@ -271,13 +347,11 @@
     homeWrap.appendChild(topBtnRow);
     homeWrap.appendChild(document.createElement('hr'));
 
-    // The user list
     userListDiv = document.createElement('div');
     homeWrap.appendChild(userListDiv);
-
     contentHome.appendChild(homeWrap);
 
-    // Populate Settings tab
+    // *** SETTINGS TAB ***
     const setWrap = document.createElement('div');
     setWrap.style.padding = '8px';
     setWrap.innerHTML = '<h3>Settings</h3>';
@@ -292,7 +366,6 @@
     showWarnCheckbox.addEventListener('change', () => {
       showConfirmForMuteAll = showWarnCheckbox.checked;
       saveSettings();
-      console.log('[Settings] showConfirmForMuteAll=', showConfirmForMuteAll);
     });
 
     showWarnLabel.appendChild(showWarnCheckbox);
@@ -301,12 +374,11 @@
 
     contentSettings.appendChild(setWrap);
 
-    // Populate Import/Export tab
+    // *** IMPORT/EXPORT TAB ***
     const impExpWrap = document.createElement('div');
     impExpWrap.style.padding = '8px';
     impExpWrap.innerHTML = '<h3>Import/Export</h3>';
 
-    // Manual insertion here
     const manualLabel = document.createElement('label');
     manualLabel.textContent = 'Manually add usernames (comma-separated):';
     manualLabel.style.display = 'block';
@@ -346,7 +418,6 @@
 
     impExpWrap.appendChild(document.createElement('hr'));
 
-    // Export portion
     impExpWrap.appendChild(document.createElement('p')).textContent =
       'All handles, one per line:';
 
@@ -366,30 +437,47 @@
 
     contentImportExport.appendChild(impExpWrap);
 
-    // Add all content areas
+    // Attach content
     box.appendChild(contentHome);
     box.appendChild(contentSettings);
     box.appendChild(contentImportExport);
 
     document.body.appendChild(box);
 
-    showTab('home'); // default
-    // Draggable + Resizable
+    showTab('home'); // default tab
+
+    // If box was closed from last time, hide it
+    if (boxClosed) {
+      box.style.display = 'none';
+      createShowBoxButtonIfNeeded();
+    }
+
+    // Make box draggable + resizable, and store changes
     interact(box).draggable({
-      allowFrom: bigTitleRow, // drag from bigTitleRow
+      allowFrom: bigTitleRow, // drag from the top row
       listeners: {
         move(e) {
           const rect = box.getBoundingClientRect();
-          box.style.left = rect.left + e.dx + 'px';
-          box.style.top = rect.top + e.dy + 'px';
+          boxPosition.x = rect.left + e.dx;
+          boxPosition.y = rect.top + e.dy;
+          box.style.left = boxPosition.x + 'px';
+          box.style.top = boxPosition.y + 'px';
+        },
+        end(e) {
+          saveBoxPositionAndSize();
         }
       }
     }).resizable({
       edges: { left: false, right: true, bottom: true, top: false },
       listeners: {
         move(e) {
-          box.style.width = e.rect.width + 'px';
-          box.style.height = e.rect.height + 'px';
+          boxSize.w = e.rect.width;
+          boxSize.h = e.rect.height;
+          box.style.width = boxSize.w + 'px';
+          box.style.height = boxSize.h + 'px';
+        },
+        end(e) {
+          saveBoxPositionAndSize();
         }
       }
     });
@@ -402,6 +490,7 @@
     btn.style.padding = '8px 12px';
     btn.style.fontSize = '14px';
   }
+
   function styleActionButton(btn) {
     btn.style.border = 'none';
     btn.style.borderRadius = '4px';
@@ -412,27 +501,27 @@
     btn.style.marginRight = '4px';
     btn.style.fontSize = '13px';
   }
+
   function createContentDiv() {
     const d = document.createElement('div');
     d.style.display = 'none'; // hidden by default
     d.style.width = '100%';
-    d.style.height = 'calc(100% - 40px)'; // minus title+tabs
+    d.style.height = 'calc(100% - 40px)'; // minus top bars
     d.style.overflow = 'auto';
     return d;
   }
+
   function showTab(name) {
-    contentHome.style.display = (name==='home')?'block':'none';
-    contentSettings.style.display = (name==='settings')?'block':'none';
-    contentImportExport.style.display = (name==='importExport')?'block':'none';
+    contentHome.style.display = (name==='home') ? 'block' : 'none';
+    contentSettings.style.display = (name==='settings') ? 'block' : 'none';
+    contentImportExport.style.display = (name==='importExport') ? 'block' : 'none';
   }
 
-  // Attempt to open new tabs in the background using noopener,noreferrer
   function openInBackground(url) {
-    // Some browsers open it in background, others may not. No guarantee.
+    // Attempting to open in background
     window.open(url, '_blank', 'noopener,noreferrer');
   }
 
-  // Export logic
   function exportAllHandles() {
     const arr = Array.from(storedProfiles);
     const text = arr.join('\n');
@@ -448,7 +537,6 @@
     });
   }
 
-  // Rebuild UI
   function rebuildUserListUI() {
     if (!userListDiv) return;
     userListDiv.innerHTML = '';
@@ -460,7 +548,7 @@
       row.style.alignItems = 'center';
       row.style.marginBottom = '6px';
 
-      // Left side: link
+      // link
       const link = document.createElement('a');
       link.style.color = '#1DA1F2';
       link.style.textDecoration = 'none';
@@ -469,7 +557,7 @@
       link.href = new URL(handlePath, location.origin).toString();
       link.textContent = handlePath;
 
-      // Middle: Mute/Unmute button
+      // Mute/Unmute
       const isMuted = (localStorage.getItem('muted:' + handlePath) === 'true');
       const muteBtn = document.createElement('button');
       styleActionButton(muteBtn);
@@ -493,24 +581,22 @@
         });
       }
 
-      // Right: "Remove" button
+      // Remove
       const removeBtn = document.createElement('button');
       removeBtn.textContent = 'Remove';
       removeBtn.style.border = 'none';
       removeBtn.style.borderRadius = '4px';
       removeBtn.style.padding = '4px 8px';
       removeBtn.style.cursor = 'pointer';
-      removeBtn.style.backgroundColor = '#f4212e'; // a bright red
+      removeBtn.style.backgroundColor = '#f4212e';
       removeBtn.style.color = '#fff';
       removeBtn.style.fontSize = '12px';
       removeBtn.addEventListener('click', () => {
-        // Remove from local set
         storedProfiles.delete(handlePath);
         saveStoredProfiles();
         rebuildUserListUI();
       });
 
-      // Combine middle & right buttons in a small wrapper
       const btnWrapper = document.createElement('div');
       btnWrapper.style.display = 'flex';
       btnWrapper.style.gap = '4px';
@@ -524,7 +610,6 @@
     });
   }
 
-  // Mute All => skip already muted
   function muteAllProfiles() {
     let countOpened = 0;
     storedProfiles.forEach(handlePath => {
@@ -540,7 +625,6 @@
     }
   }
 
-  // Processing new "User-Name" blocks
   function processUserDiv(userDiv) {
     if (processedUserDivs.has(userDiv)) return;
     processedUserDivs.add(userDiv);
@@ -562,14 +646,20 @@
   }
 
   function observeFeed() {
-    // Load data
     loadSettings();
     loadStoredProfiles();
-
+    createShowBoxButtonIfNeeded(); // create the "Show Box" button if needed
     createBoxIfNeeded();
     rebuildUserListUI();
 
-    // Listen for localStorage changes => update UI
+    // If boxClosed was true, we hide the box
+    if (boxClosed && box) {
+      box.style.display = 'none';
+      // ensure the show button is visible
+      if (showBoxButton) showBoxButton.style.display = 'block';
+    }
+
+    // watch localStorage for changes
     window.addEventListener('storage', e => {
       if (e.key && e.key.startsWith('muted:')) {
         console.log('[Feed] Storage changed =>', e.key, e.newValue);
@@ -577,6 +667,7 @@
       }
     });
 
+    // Observer
     const mainEl = document.querySelector('main[role="main"]') || document.body;
     const observer = new MutationObserver(muts => {
       for (const mut of muts) {
@@ -593,7 +684,7 @@
     });
     observer.observe(mainEl, { childList: true, subtree: true });
 
-    console.log('[Feed] Observer started => Attempting background tabs with noopener, all else unchanged.');
+    console.log('[Feed] Observer started => Storing size/pos, close button, show button, etc.');
   }
 
   window.addEventListener('load', observeFeed);
