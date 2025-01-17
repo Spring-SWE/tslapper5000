@@ -1,0 +1,601 @@
+// ==UserScript==
+// @name         X.com Trans Slapper 5000
+// @namespace    https://your-namespace.example
+// @version      1.0
+// @description  Collect trans-flag users and mute them.
+// @match        https://x.com/*
+// @match        https://www.x.com/*
+// @match        https://twitter.com/*
+// @match        https://www.twitter.com/*
+// @grant        none
+// @run-at       document-idle
+// @require      https://cdn.jsdelivr.net/npm/interactjs@1.10.18/dist/interact.min.js
+// ==/UserScript==
+
+(function() {
+  'use strict';
+
+  /***************************************************************************
+   * Profile Auto-Mute or Auto-Unmute
+   ***************************************************************************/
+  const path = location.pathname; // e.g. "/SomeUser"
+  const isProfilePage = (
+    path.startsWith('/') &&
+    !path.includes('/status/') &&
+    /^\/[^/]+$/.test(path)
+  );
+  const urlParams = new URLSearchParams(location.search);
+  const isAutoMuteParam = (urlParams.get('autoMute') === '1');
+  const isAutoUnmuteParam = (urlParams.get('autoUnmute') === '1');
+
+  if (isProfilePage && (isAutoMuteParam || isAutoUnmuteParam)) {
+    setTimeout(() => {
+      if (isAutoMuteParam) attemptAutoMuteUI();
+      if (isAutoUnmuteParam) attemptAutoUnmuteUI();
+    }, 2000);
+  }
+
+  function attemptAutoMuteUI() {
+    console.log('[AutoMute] Attempting Mute =>', path);
+    clickMoreThenItem('mute', 'confirmationSheetConfirm', () => {
+      localStorage.setItem('muted:' + path, 'true');
+      console.log('[AutoMute] Marked muted =>', path);
+      setTimeout(() => window.close(), 1000);
+    });
+  }
+
+  function attemptAutoUnmuteUI() {
+    console.log('[AutoUnmute] Attempting Unmute =>', path);
+    // The same data-testid="mute", so we must ensure text includes "Unmute"
+    clickMoreThenItem('mute', 'confirmationSheetConfirm', () => {
+      localStorage.setItem('muted:' + path, 'false');
+      console.log('[AutoUnmute] Marked unmuted =>', path);
+      setTimeout(() => window.close(), 1000);
+    }, true /* matchUnmuteText */);
+  }
+
+  /**
+   * clickMoreThenItem('mute','confirmationSheetConfirm', cb, matchUnmuteText=false)
+   * - Finds "More" button
+   * - data-testid=menuTestId
+   * - optionally confirm
+   * - callback
+   */
+  function clickMoreThenItem(menuTestId, confirmTestId, onSuccess, matchUnmuteText=false) {
+    let moreBtn = document.querySelector('button[data-testid="userActions"][aria-label^="More"]')
+      || document.querySelector('div[data-testid="userActions"] [role="button"][aria-label^="More"]');
+    if (!moreBtn) {
+      console.warn('[UIFlow] More button not found => retry in 1s');
+      setTimeout(() => clickMoreThenItem(menuTestId, confirmTestId, onSuccess, matchUnmuteText), 1000);
+      return;
+    }
+    moreBtn.click();
+
+    setTimeout(() => {
+      const allItems = document.querySelectorAll(`div[data-testid="${menuTestId}"]`);
+      if (!allItems.length) {
+        console.warn(`[UIFlow] data-testid="${menuTestId}" not found. Maybe user is already in that state.`);
+        onSuccess && onSuccess();
+        return;
+      }
+
+      let item = null;
+      if (matchUnmuteText) {
+        // find "Unmute" text
+        for (const el of allItems) {
+          if (el.innerText.toLowerCase().includes('unmute')) {
+            item = el;
+            break;
+          }
+        }
+      } else {
+        item = allItems[0];
+      }
+      if (!item) {
+        console.warn('[UIFlow] No matching item with correct text => user might be unmuted already.');
+        onSuccess && onSuccess();
+        return;
+      }
+      item.click();
+
+      setTimeout(() => {
+        if (!confirmTestId) {
+          onSuccess && onSuccess();
+          return;
+        }
+        const confirmBtn = document.querySelector(`div[data-testid="${confirmTestId}"]`)
+          || document.querySelector(`button[data-testid="${confirmTestId}"]`);
+        if (!confirmBtn) {
+          console.warn('[UIFlow] Confirm not found =>', confirmTestId);
+          onSuccess && onSuccess();
+          return;
+        }
+        confirmBtn.click();
+        onSuccess && onSuccess();
+      }, 600);
+    }, 600);
+  }
+
+  /***************************************************************************
+   * Main Feed Logic - Resizable + Tabs + Mute/Unmute + Remove + Clear All
+   ***************************************************************************/
+  const processedUserDivs = new WeakSet();
+  let storedProfiles = new Set();
+
+  // We'll store a boolean setting "showConfirmForMuteAll" in localStorage
+  // Default: true
+  let showConfirmForMuteAll = true;
+
+  let box = null;
+  let bigTitleRow = null;
+  let tabsContainer = null;
+  let tabHome = null, tabSettings = null, tabImportExport = null;
+  let contentHome = null, contentSettings = null, contentImportExport = null;
+
+  let userListDiv = null;
+  let manualInputField = null;
+
+  //--- Local helper to manage settings
+  function loadSettings() {
+    const val = localStorage.getItem('showConfirmForMuteAll');
+    if (val === 'false') {
+      showConfirmForMuteAll = false;
+    } else {
+      showConfirmForMuteAll = true; // default
+    }
+  }
+  function saveSettings() {
+    localStorage.setItem('showConfirmForMuteAll', showConfirmForMuteAll ? 'true' : 'false');
+  }
+
+  //--- Local helper to manage user store
+  function loadStoredProfiles() {
+    try {
+      const raw = localStorage.getItem('transFlagUsers');
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) storedProfiles = new Set(arr);
+      }
+    } catch (e) {
+      console.error('[Feed] parse transFlagUsers error:', e);
+    }
+  }
+  function saveStoredProfiles() {
+    localStorage.setItem('transFlagUsers', JSON.stringify(Array.from(storedProfiles)));
+  }
+
+  //--- Create the box (resizable, tabbed)
+  function createBoxIfNeeded() {
+    if (box) return;
+
+    console.log('[Feed] Creating tabbed, resizable box...');
+    box = document.createElement('div');
+    box.id = 'trans-flag-box';
+    // Basic styling
+    box.style.position = 'fixed';
+    box.style.top = '20px';
+    box.style.right = '20px';
+    box.style.width = '360px';
+    box.style.height = '420px';
+    box.style.border = '1px solid #ccc';
+    box.style.borderRadius = '8px';
+    box.style.backgroundColor = 'rgba(255, 255, 255, 0.97)';
+    box.style.color = '#000';
+    box.style.padding = '0';
+    box.style.fontFamily = 'Arial, sans-serif';
+    box.style.fontSize = '14px';
+    box.style.overflow = 'hidden';
+    box.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
+    box.style.zIndex = '999999';
+
+    // Row 1: Big Title
+    bigTitleRow = document.createElement('div');
+    bigTitleRow.style.display = 'flex';
+    bigTitleRow.style.alignItems = 'center';
+    bigTitleRow.style.padding = '10px';
+    bigTitleRow.style.borderBottom = '1px solid #ccc';
+    bigTitleRow.style.fontSize = '16px';
+    bigTitleRow.style.fontWeight = 'bold';
+    bigTitleRow.textContent = 'Trans Flag Detected';
+
+    box.appendChild(bigTitleRow);
+
+    // Row 2: the tabs container
+    tabsContainer = document.createElement('div');
+    tabsContainer.style.display = 'flex';
+    tabsContainer.style.alignItems = 'center';
+    tabsContainer.style.borderBottom = '1px solid #ccc';
+    tabsContainer.style.backgroundColor = '#f5f5f5';
+
+    // We do NOT put big title in here, so it's separate
+    tabHome = document.createElement('button');
+    styleTabButton(tabHome);
+    tabHome.textContent = 'Home';
+    tabHome.addEventListener('click', () => showTab('home'));
+
+    tabSettings = document.createElement('button');
+    styleTabButton(tabSettings);
+    tabSettings.textContent = 'Settings';
+    tabSettings.addEventListener('click', () => showTab('settings'));
+
+    tabImportExport = document.createElement('button');
+    styleTabButton(tabImportExport);
+    tabImportExport.textContent = 'Import/Export';
+    tabImportExport.addEventListener('click', () => showTab('importExport'));
+
+    tabsContainer.appendChild(tabHome);
+    tabsContainer.appendChild(tabSettings);
+    tabsContainer.appendChild(tabImportExport);
+
+    box.appendChild(tabsContainer);
+
+    // Content areas
+    contentHome = createContentDiv();
+    contentSettings = createContentDiv();
+    contentImportExport = createContentDiv();
+
+    // Populate Home tab
+    const homeWrap = document.createElement('div');
+    homeWrap.style.padding = '8px';
+
+    // Button row: Mute All + Clear All
+    const topBtnRow = document.createElement('div');
+    topBtnRow.style.display = 'flex';
+    topBtnRow.style.gap = '8px';
+
+    // "Mute All"
+    const muteAllBtn = document.createElement('button');
+    styleActionButton(muteAllBtn);
+    muteAllBtn.textContent = 'Mute All';
+    muteAllBtn.addEventListener('click', () => {
+      if (showConfirmForMuteAll) {
+        if (!confirm('Mute all found users? This will open new tabs.')) return;
+      }
+      muteAllProfiles();
+    });
+    topBtnRow.appendChild(muteAllBtn);
+
+    // "Clear All"
+    const clearAllBtn = document.createElement('button');
+    styleActionButton(clearAllBtn);
+    clearAllBtn.textContent = 'Clear All';
+    clearAllBtn.style.backgroundColor = '#f4212e'; // a red color
+    clearAllBtn.addEventListener('click', () => {
+      if (!confirm('Are you sure you want to remove all from the list?')) return;
+      storedProfiles.clear();
+      saveStoredProfiles();
+      rebuildUserListUI();
+    });
+    topBtnRow.appendChild(clearAllBtn);
+
+    homeWrap.appendChild(topBtnRow);
+    homeWrap.appendChild(document.createElement('hr'));
+
+    // The user list
+    userListDiv = document.createElement('div');
+    homeWrap.appendChild(userListDiv);
+
+    contentHome.appendChild(homeWrap);
+
+    // Populate Settings tab
+    const setWrap = document.createElement('div');
+    setWrap.style.padding = '8px';
+    setWrap.innerHTML = '<h3>Settings</h3>';
+
+    const showWarnLabel = document.createElement('label');
+    showWarnLabel.style.display = 'block';
+    showWarnLabel.style.marginTop = '6px';
+
+    const showWarnCheckbox = document.createElement('input');
+    showWarnCheckbox.type = 'checkbox';
+    showWarnCheckbox.checked = showConfirmForMuteAll;
+    showWarnCheckbox.addEventListener('change', () => {
+      showConfirmForMuteAll = showWarnCheckbox.checked;
+      saveSettings();
+      console.log('[Settings] showConfirmForMuteAll=', showConfirmForMuteAll);
+    });
+
+    showWarnLabel.appendChild(showWarnCheckbox);
+    showWarnLabel.append(' Show confirmation for Mute All');
+    setWrap.appendChild(showWarnLabel);
+
+    contentSettings.appendChild(setWrap);
+
+    // Populate Import/Export tab
+    const impExpWrap = document.createElement('div');
+    impExpWrap.style.padding = '8px';
+    impExpWrap.innerHTML = '<h3>Import/Export</h3>';
+
+    // Manual insertion here
+    const manualLabel = document.createElement('label');
+    manualLabel.textContent = 'Manually add usernames (comma-separated):';
+    manualLabel.style.display = 'block';
+    manualLabel.style.marginTop = '4px';
+    impExpWrap.appendChild(manualLabel);
+
+    manualInputField = document.createElement('textarea');
+    manualInputField.rows = 2;
+    manualInputField.style.width = '100%';
+    manualInputField.style.marginTop = '4px';
+    impExpWrap.appendChild(manualInputField);
+
+    const addManualBtn = document.createElement('button');
+    styleActionButton(addManualBtn);
+    addManualBtn.textContent = 'Add Names';
+    addManualBtn.style.marginTop = '4px';
+    addManualBtn.addEventListener('click', () => {
+      const rawText = manualInputField.value.trim();
+      if (!rawText) return;
+      const parts = rawText.split(',');
+      let count = 0;
+      for (const p of parts) {
+        const handlePath = p.trim();
+        if (!handlePath) continue;
+        if (!storedProfiles.has(handlePath)) {
+          storedProfiles.add(handlePath);
+          count++;
+        }
+      }
+      if (count > 0) {
+        saveStoredProfiles();
+        rebuildUserListUI();
+      }
+      manualInputField.value = '';
+    });
+    impExpWrap.appendChild(addManualBtn);
+
+    impExpWrap.appendChild(document.createElement('hr'));
+
+    // Export portion
+    impExpWrap.appendChild(document.createElement('p')).textContent =
+      'All handles, one per line:';
+
+    const exportBtn = document.createElement('button');
+    styleActionButton(exportBtn);
+    exportBtn.textContent = 'Export All';
+    exportBtn.style.marginTop = '4px';
+    exportBtn.addEventListener('click', exportAllHandles);
+    impExpWrap.appendChild(exportBtn);
+
+    const expArea = document.createElement('textarea');
+    expArea.id = 'exportArea';
+    expArea.style.width = '100%';
+    expArea.style.height = '80px';
+    expArea.style.marginTop = '4px';
+    impExpWrap.appendChild(expArea);
+
+    contentImportExport.appendChild(impExpWrap);
+
+    // Add all content areas
+    box.appendChild(contentHome);
+    box.appendChild(contentSettings);
+    box.appendChild(contentImportExport);
+
+    document.body.appendChild(box);
+
+    showTab('home'); // default
+    // Draggable + Resizable
+    interact(box).draggable({
+      allowFrom: bigTitleRow, // drag from bigTitleRow
+      listeners: {
+        move(e) {
+          const rect = box.getBoundingClientRect();
+          box.style.left = rect.left + e.dx + 'px';
+          box.style.top = rect.top + e.dy + 'px';
+        }
+      }
+    }).resizable({
+      edges: { left: false, right: true, bottom: true, top: false },
+      listeners: {
+        move(e) {
+          box.style.width = e.rect.width + 'px';
+          box.style.height = e.rect.height + 'px';
+        }
+      }
+    });
+  }
+
+  function styleTabButton(btn) {
+    btn.style.border = 'none';
+    btn.style.background = 'transparent';
+    btn.style.cursor = 'pointer';
+    btn.style.padding = '8px 12px';
+    btn.style.fontSize = '14px';
+  }
+  function styleActionButton(btn) {
+    btn.style.border = 'none';
+    btn.style.borderRadius = '4px';
+    btn.style.padding = '4px 8px';
+    btn.style.cursor = 'pointer';
+    btn.style.backgroundColor = '#1DA1F2';
+    btn.style.color = '#fff';
+    btn.style.marginRight = '4px';
+    btn.style.fontSize = '13px';
+  }
+  function createContentDiv() {
+    const d = document.createElement('div');
+    d.style.display = 'none'; // hidden by default
+    d.style.width = '100%';
+    d.style.height = 'calc(100% - 40px)'; // minus title+tabs
+    d.style.overflow = 'auto';
+    return d;
+  }
+  function showTab(name) {
+    contentHome.style.display = (name==='home')?'block':'none';
+    contentSettings.style.display = (name==='settings')?'block':'none';
+    contentImportExport.style.display = (name==='importExport')?'block':'none';
+  }
+
+  // Attempt to open new tabs in the background using noopener,noreferrer
+  function openInBackground(url) {
+    // Some browsers open it in background, others may not. No guarantee.
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+
+  // Export logic
+  function exportAllHandles() {
+    const arr = Array.from(storedProfiles);
+    const text = arr.join('\n');
+    const expArea = document.getElementById('exportArea');
+    if (expArea) {
+      expArea.value = text;
+    }
+    navigator.clipboard.writeText(text).then(()=>{
+      alert('Export copied to clipboard!');
+    }).catch(err=>{
+      console.warn('Clipboard error', err);
+      alert('Unable to copy to clipboard. See console.');
+    });
+  }
+
+  // Rebuild UI
+  function rebuildUserListUI() {
+    if (!userListDiv) return;
+    userListDiv.innerHTML = '';
+
+    storedProfiles.forEach(handlePath => {
+      const row = document.createElement('div');
+      row.style.display = 'flex';
+      row.style.justifyContent = 'space-between';
+      row.style.alignItems = 'center';
+      row.style.marginBottom = '6px';
+
+      // Left side: link
+      const link = document.createElement('a');
+      link.style.color = '#1DA1F2';
+      link.style.textDecoration = 'none';
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.href = new URL(handlePath, location.origin).toString();
+      link.textContent = handlePath;
+
+      // Middle: Mute/Unmute button
+      const isMuted = (localStorage.getItem('muted:' + handlePath) === 'true');
+      const muteBtn = document.createElement('button');
+      styleActionButton(muteBtn);
+      muteBtn.style.fontSize = '12px';
+
+      if (isMuted) {
+        muteBtn.textContent = 'Unmute';
+        muteBtn.style.backgroundColor = '#888'; // grey
+        link.style.opacity = '0.6';
+        muteBtn.addEventListener('click', () => {
+          const unUrl = new URL(handlePath, location.origin);
+          unUrl.searchParams.set('autoUnmute','1');
+          openInBackground(unUrl.toString());
+        });
+      } else {
+        muteBtn.textContent = 'Mute';
+        muteBtn.addEventListener('click', () => {
+          const mUrl = new URL(handlePath, location.origin);
+          mUrl.searchParams.set('autoMute','1');
+          openInBackground(mUrl.toString());
+        });
+      }
+
+      // Right: "Remove" button
+      const removeBtn = document.createElement('button');
+      removeBtn.textContent = 'Remove';
+      removeBtn.style.border = 'none';
+      removeBtn.style.borderRadius = '4px';
+      removeBtn.style.padding = '4px 8px';
+      removeBtn.style.cursor = 'pointer';
+      removeBtn.style.backgroundColor = '#f4212e'; // a bright red
+      removeBtn.style.color = '#fff';
+      removeBtn.style.fontSize = '12px';
+      removeBtn.addEventListener('click', () => {
+        // Remove from local set
+        storedProfiles.delete(handlePath);
+        saveStoredProfiles();
+        rebuildUserListUI();
+      });
+
+      // Combine middle & right buttons in a small wrapper
+      const btnWrapper = document.createElement('div');
+      btnWrapper.style.display = 'flex';
+      btnWrapper.style.gap = '4px';
+      btnWrapper.appendChild(muteBtn);
+      btnWrapper.appendChild(removeBtn);
+
+      row.appendChild(link);
+      row.appendChild(btnWrapper);
+
+      userListDiv.appendChild(row);
+    });
+  }
+
+  // Mute All => skip already muted
+  function muteAllProfiles() {
+    let countOpened = 0;
+    storedProfiles.forEach(handlePath => {
+      const isMuted = (localStorage.getItem('muted:' + handlePath) === 'true');
+      if (isMuted) return;
+      const mUrl = new URL(handlePath, location.origin);
+      mUrl.searchParams.set('autoMute','1');
+      openInBackground(mUrl.toString());
+      countOpened++;
+    });
+    if (!countOpened) {
+      alert('No unmuted users found to Mute.');
+    }
+  }
+
+  // Processing new "User-Name" blocks
+  function processUserDiv(userDiv) {
+    if (processedUserDivs.has(userDiv)) return;
+    processedUserDivs.add(userDiv);
+
+    const transFlagImg = userDiv.querySelector('img[alt*="🏳"], img[alt*="⚧"]');
+    if (!transFlagImg) return;
+
+    const link = userDiv.querySelector('a[href^="/"]');
+    if (!link) return;
+    const handlePath = link.getAttribute('href');
+    if (!handlePath) return;
+
+    if (!storedProfiles.has(handlePath)) {
+      storedProfiles.add(handlePath);
+      saveStoredProfiles();
+      rebuildUserListUI();
+      console.log('[TransFlag] Found =>', handlePath);
+    }
+  }
+
+  function observeFeed() {
+    // Load data
+    loadSettings();
+    loadStoredProfiles();
+
+    createBoxIfNeeded();
+    rebuildUserListUI();
+
+    // Listen for localStorage changes => update UI
+    window.addEventListener('storage', e => {
+      if (e.key && e.key.startsWith('muted:')) {
+        console.log('[Feed] Storage changed =>', e.key, e.newValue);
+        rebuildUserListUI();
+      }
+    });
+
+    const mainEl = document.querySelector('main[role="main"]') || document.body;
+    const observer = new MutationObserver(muts => {
+      for (const mut of muts) {
+        for (const addedNode of mut.addedNodes) {
+          if (addedNode.nodeType !== Node.ELEMENT_NODE) continue;
+          if (addedNode.matches?.('div[data-testid="User-Name"]')) {
+            processUserDiv(addedNode);
+          } else {
+            const userDivs = addedNode.querySelectorAll?.('div[data-testid="User-Name"]');
+            userDivs?.forEach(div => processUserDiv(div));
+          }
+        }
+      }
+    });
+    observer.observe(mainEl, { childList: true, subtree: true });
+
+    console.log('[Feed] Observer started => Attempting background tabs with noopener, all else unchanged.');
+  }
+
+  window.addEventListener('load', observeFeed);
+
+})();
